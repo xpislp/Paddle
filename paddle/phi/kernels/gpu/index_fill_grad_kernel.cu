@@ -13,140 +13,171 @@
 // limitations under the License.
 
 #include "paddle/phi/kernels/index_fill_grad_kernel.h"
+
+#include <algorithm>
+#include <climits>
+
 #include "paddle/phi/backends/gpu/gpu_context.h"
-#include "paddle/phi/backends/gpu/gpu_launch_config.h"
+#include "paddle/phi/common/data_type.h"
+#include "paddle/phi/core/enforce.h"
 #include "paddle/phi/core/kernel_registry.h"
 #include "paddle/phi/core/tensor_utils.h"
 #include "paddle/phi/kernels/funcs/index_fill_util.h"
 
 namespace phi {
 
-// GPU kernel for index_fill backward pass.
+// Backward of index_fill.
 //
-// Gradient logic:
-//   Forward: out[..., index[i], ...] = fill_value (a constant scalar)
-//   Since the filled positions are overwritten with a constant, their
-//   gradient w.r.t. x is zero. All other positions have gradient = out_grad.
-//
-//   So the backward is:
+//   Forward: out[..., index[i], ...] = constant
+//   Because the filled positions are overwritten by a constant, their gradient
+//   w.r.t. x is zero; every other position passes the gradient through. There
+//   is no value gradient (value is a scalar constant). So:
 //     1) x_grad = copy(out_grad)
-//     2) x_grad[..., index[i], ...] = 0   (this kernel does step 2)
+//     2) x_grad[..., index[i], ...] = 0
 //
-//   There is no value_grad because `value` is a scalar constant, not a tensor.
-//
-// Uses the same three-segment decomposition as the forward kernel.
-template <typename T>
-__global__ void IndexFillGradCudaKernel(const int64_t* index,
-                                        const int64_t index_size,
-                                        const int64_t dim_size,
-                                        const int64_t outer_size,
-                                        const int64_t inner_size,
-                                        T* x_grad) {
-  int64_t idx =
-      static_cast<int64_t>(threadIdx.x) +
-      static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(blockIdx.x);
-  int64_t total = index_size * outer_size * inner_size;
+// Step 2 is an index_fill with value 0, using the same small/large index
+// kernels (with grid-stride loops) as the forward pass.
 
-  if (idx >= total) {
-    return;
+template <typename T, typename IndexT, typename IndT>
+__global__ void IndexFillGradSmallIndexCudaKernel(const IndT* index,
+                                                  const IndexT index_size,
+                                                  const IndexT inner_size,
+                                                  const IndexT slice_size,
+                                                  const int64_t dim_size,
+                                                  T* x_grad) {
+  const IndexT dim_stride = static_cast<IndexT>(dim_size) * inner_size;
+  for (IndexT i = 0; i < index_size; ++i) {
+    int64_t dim_idx = static_cast<int64_t>(index[i]);
+    if (dim_idx < 0) dim_idx += dim_size;              // negative indexing
+    if (dim_idx < 0 || dim_idx >= dim_size) continue;  // out-of-bounds guard
+
+    const IndexT base = static_cast<IndexT>(dim_idx) * inner_size;
+    for (IndexT linear =
+             static_cast<IndexT>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < slice_size;
+         linear += static_cast<IndexT>(gridDim.x) * blockDim.x) {
+      const IndexT outer_idx = linear / inner_size;
+      const IndexT inner_idx = linear - outer_idx * inner_size;
+      x_grad[outer_idx * dim_stride + base + inner_idx] = static_cast<T>(0);
+    }
   }
-
-  // Same three-segment coordinate decomposition as the forward kernel.
-  int64_t inner_idx = idx % inner_size;
-  int64_t temp = idx / inner_size;
-  int64_t index_idx = temp % index_size;
-  int64_t outer_idx = temp / index_size;
-
-  int64_t dim_idx = index[index_idx];
-  if (dim_idx < 0) {
-    dim_idx += dim_size;
-  }
-
-  if (dim_idx < 0 || dim_idx >= dim_size) {
-    return;
-  }
-
-  int64_t offset =
-      outer_idx * dim_size * inner_size + dim_idx * inner_size + inner_idx;
-
-  // Zero out the gradient at filled positions, because forward wrote a
-  // constant.
-  *(x_grad + offset) = static_cast<T>(0);
 }
 
-// Host-side launch function for the backward kernel.
-template <typename T, typename Context>
+template <typename T, typename IndexT, typename IndT>
+__global__ void IndexFillGradLargeIndexCudaKernel(const IndT* index,
+                                                  const IndexT inner_size,
+                                                  const IndexT slice_size,
+                                                  const IndexT total,
+                                                  const int64_t dim_size,
+                                                  T* x_grad) {
+  const IndexT dim_stride = static_cast<IndexT>(dim_size) * inner_size;
+  for (IndexT linear =
+           static_cast<IndexT>(blockIdx.x) * blockDim.x + threadIdx.x;
+       linear < total;
+       linear += static_cast<IndexT>(gridDim.x) * blockDim.x) {
+    const IndexT index_idx = linear / slice_size;
+    const IndexT slice_off = linear - index_idx * slice_size;
+
+    int64_t dim_idx = static_cast<int64_t>(index[index_idx]);
+    if (dim_idx < 0) dim_idx += dim_size;              // negative indexing
+    if (dim_idx < 0 || dim_idx >= dim_size) continue;  // out-of-bounds guard
+
+    const IndexT outer_idx = slice_off / inner_size;
+    const IndexT inner_idx = slice_off - outer_idx * inner_size;
+    x_grad[outer_idx * dim_stride +
+           static_cast<IndexT>(dim_idx) * inner_size + inner_idx] =
+        static_cast<T>(0);
+  }
+}
+
+template <typename T, typename IndexT, typename IndT>
+void LaunchIndexFillGradCudaKernelImpl(const phi::GPUContext& dev_ctx,
+                                       const IndT* index_data,
+                                       int64_t index_size,
+                                       int64_t outer_size,
+                                       int64_t dim_size,
+                                       int64_t inner_size,
+                                       T* x_grad_data) {
+  const IndexT slice_size =
+      static_cast<IndexT>(outer_size) * static_cast<IndexT>(inner_size);
+  if (slice_size == 0) return;
+
+  constexpr int kBlock = 128;
+  const int64_t sm = dev_ctx.GetSMCount();
+  auto stream = dev_ctx.stream();
+
+  auto grid_for = [&](int64_t work) -> int {
+    int64_t blocks = (work + kBlock - 1) / kBlock;
+    blocks = std::min<int64_t>(blocks, sm * 8);  // cap; grid-stride covers rest
+    return static_cast<int>(std::max<int64_t>(blocks, 1));
+  };
+
+  if (index_size <= funcs::kIndexFillSmallIndexThreshold) {
+    IndexFillGradSmallIndexCudaKernel<T, IndexT, IndT>
+        <<<grid_for(slice_size), kBlock, 0, stream>>>(
+            index_data,
+            static_cast<IndexT>(index_size),
+            static_cast<IndexT>(inner_size),
+            slice_size,
+            dim_size,
+            x_grad_data);
+  } else {
+    const IndexT total = slice_size * static_cast<IndexT>(index_size);
+    IndexFillGradLargeIndexCudaKernel<T, IndexT, IndT>
+        <<<grid_for(total), kBlock, 0, stream>>>(index_data,
+                                                 static_cast<IndexT>(inner_size),
+                                                 slice_size,
+                                                 total,
+                                                 dim_size,
+                                                 x_grad_data);
+  }
+}
+
+template <typename T, typename Context, typename IndT>
 void LaunchIndexFillGradCudaKernel(const Context& dev_ctx,
                                    const DenseTensor& index,
                                    const DenseTensor& out_grad,
                                    const int dim,
                                    DenseTensor* x_grad) {
-  // Step 1: x_grad = out_grad (full copy first, then zero out selected
-  // positions)
+  // Step 1: x_grad = out_grad.
+  T* x_grad_data = dev_ctx.template Alloc<T>(x_grad);
   Copy(dev_ctx, out_grad, dev_ctx.GetPlace(), false, x_grad);
 
-  auto out_grad_dims = out_grad.dims();
-  const int rank = out_grad_dims.size();
-
-  // Cast index to int64 if needed (same logic as forward kernel).
-  DenseTensor index_int64;
-  const DenseTensor* ptr_index = nullptr;
-
-  if (index.dtype() == DataType::INT32) {
-    index_int64.Resize(index.dims());
-    dev_ctx.template Alloc<int64_t>(&index_int64);
-
-    int64_t index_numel = index.numel();
-    auto config = backends::gpu::GetGpuLaunchConfig1D(dev_ctx, index_numel);
-
-    funcs::CastToInt64Kernel<int32_t><<<config.block_per_grid,
-                                        config.thread_per_block,
-                                        0,
-                                        dev_ctx.stream()>>>(
-        index.data<int32_t>(), index_int64.data<int64_t>(), index_numel);
-
-    ptr_index = &index_int64;
-  } else if (index.dtype() == DataType::INT64) {
-    ptr_index = &index;
-  } else {
-    PADDLE_THROW(common::errors::InvalidArgument(
-        "The dtype of index must be int32 or int64, but received %s.",
-        DataTypeToString(index.dtype())));
-  }
-
-  const int64_t* index_data = ptr_index->data<int64_t>();
-  int64_t index_size = ptr_index->numel();
-
+  int64_t index_size = index.numel();
   if (index_size == 0) {
     return;
   }
 
-  // Three-segment decomposition (same as forward).
   int64_t outer_size = 1;
+  int64_t dim_size = 1;
   int64_t inner_size = 1;
-  int64_t dim_size = out_grad_dims[dim];
+  funcs::GetIndexFillDims(
+      out_grad.dims(), dim, &outer_size, &dim_size, &inner_size);
 
-  for (int i = 0; i < dim; ++i) {
-    outer_size *= out_grad_dims[i];
+  const int64_t slice_size = outer_size * inner_size;
+  if (slice_size == 0) return;
+
+  const int64_t total = slice_size * index_size;
+  const int64_t max_index = std::max(slice_size * dim_size, total);
+
+  const IndT* index_data = index.data<IndT>();
+  if (max_index <= static_cast<int64_t>(INT_MAX)) {
+    LaunchIndexFillGradCudaKernelImpl<T, int32_t, IndT>(dev_ctx,
+                                                        index_data,
+                                                        index_size,
+                                                        outer_size,
+                                                        dim_size,
+                                                        inner_size,
+                                                        x_grad_data);
+  } else {
+    LaunchIndexFillGradCudaKernelImpl<T, int64_t, IndT>(dev_ctx,
+                                                        index_data,
+                                                        index_size,
+                                                        outer_size,
+                                                        dim_size,
+                                                        inner_size,
+                                                        x_grad_data);
   }
-  for (int i = dim + 1; i < rank; ++i) {
-    inner_size *= out_grad_dims[i];
-  }
-
-  // Step 2: launch kernel to zero out gradients at the filled positions.
-  int64_t numel = outer_size * index_size * inner_size;
-  auto config = backends::gpu::GetGpuLaunchConfig1D(dev_ctx, numel);
-
-  T* x_grad_data = x_grad->data<T>();
-
-  IndexFillGradCudaKernel<T>
-      <<<config.block_per_grid, config.thread_per_block, 0, dev_ctx.stream()>>>(
-          index_data,
-          index_size,
-          dim_size,
-          outer_size,
-          inner_size,
-          x_grad_data);
 }
 
 // Top-level backward kernel entry: validates inputs and dispatches.
@@ -160,8 +191,6 @@ void IndexFillGradKernel(const Context& dev_ctx,
     dev_ctx.template Alloc<T>(x_grad);
     return;
   }
-
-  dev_ctx.template Alloc<T>(x_grad);
 
   auto out_grad_dims = out_grad.dims();
   const int rank = out_grad_dims.size();
@@ -185,12 +214,22 @@ void IndexFillGradKernel(const Context& dev_ctx,
           dim));
 
   if (index.numel() == 0) {
+    dev_ctx.template Alloc<T>(x_grad);
     Copy(dev_ctx, out_grad, dev_ctx.GetPlace(), false, x_grad);
     return;
   }
 
-  LaunchIndexFillGradCudaKernel<T, Context>(
-      dev_ctx, index, out_grad, dim, x_grad);
+  if (index.dtype() == DataType::INT32) {
+    LaunchIndexFillGradCudaKernel<T, Context, int32_t>(
+        dev_ctx, index, out_grad, dim, x_grad);
+  } else if (index.dtype() == DataType::INT64) {
+    LaunchIndexFillGradCudaKernel<T, Context, int64_t>(
+        dev_ctx, index, out_grad, dim, x_grad);
+  } else {
+    PADDLE_THROW(common::errors::InvalidArgument(
+        "The dtype of index must be int32 or int64, but received %s.",
+        DataTypeToString(index.dtype())));
+  }
 }
 
 }  // namespace phi

@@ -14,49 +14,52 @@
 
 #include "paddle/phi/kernels/index_fill_kernel.h"
 
+#include <algorithm>
+#include <cstring>
+
 #include "paddle/phi/backends/cpu/cpu_context.h"
+#include "paddle/phi/common/data_type.h"
+#include "paddle/phi/core/enforce.h"
 #include "paddle/phi/core/kernel_registry.h"
+#include "paddle/phi/kernels/funcs/index_fill_util.h"
 
 namespace phi {
 
-// CPU implementation of the index_fill core loop.
-// Uses the same three-segment decomposition as the GPU kernel:
-//   offset = outer * (dim_size * inner_size) + idx * inner_size + inner
+// CPU index_fill core, using the same [outer_size, dim_size, inner_size]
+// decomposition as the GPU kernel:
 //
-// Loop order: index (outermost, OMP-parallelized) → outer → inner (innermost).
-// Putting the index loop outermost ensures each OMP thread works on independent
-// slices. Putting inner loop innermost ensures contiguous memory writes,
-// which is cache-friendly on CPU.
-template <typename T>
-void index_fill_kernel(const int64_t* index_data,
-                       const int64_t index_size,
-                       const T fill_value,
-                       const int64_t outer_size,
-                       const int64_t dim_size,
-                       const int64_t inner_size,
-                       T* out) {
+//     offset = outer * (dim_size * inner_size) + dim_idx * inner_size
+//
+// We parallelize over the (outer * index) slices rather than over the index
+// dimension alone — index_fill is usually called with very few indices, so
+// parallelizing only over indices leaves most cores idle. Each slice is a
+// contiguous run of `inner_size` elements, filled with a single std::fill_n.
+// `IndT` is the index dtype, so int32 indices need no separate cast pass.
+template <typename T, typename IndT>
+void IndexFillInner(const IndT* index_data,
+                    int64_t index_size,
+                    int64_t outer_size,
+                    int64_t dim_size,
+                    int64_t inner_size,
+                    T fill_value,
+                    T* out) {
+  const int64_t num_slices = outer_size * index_size;
 #ifdef PADDLE_WITH_MKLML
 #pragma omp parallel for
 #endif
-  for (int64_t i = 0; i < index_size; ++i) {
-    int64_t idx = index_data[i];
-    if (idx < 0) {
-      idx += dim_size;
-    }
+  for (int64_t k = 0; k < num_slices; ++k) {
+    const int64_t outer = k / index_size;
+    const int64_t i = k % index_size;
 
-    for (int64_t outer = 0; outer < outer_size; ++outer) {
-      int64_t base_offset = outer * dim_size * inner_size + idx * inner_size;
+    int64_t dim_idx = static_cast<int64_t>(index_data[i]);
+    if (dim_idx < 0) dim_idx += dim_size;  // negative indexing
 
-      // This innermost loop writes to contiguous memory (good for cache).
-      for (int64_t inner = 0; inner < inner_size; ++inner) {
-        out[base_offset + inner] = fill_value;
-      }
-    }
+    T* dst = out + outer * dim_size * inner_size + dim_idx * inner_size;
+    std::fill_n(dst, inner_size, fill_value);
   }
 }
 
-// CPU host-side launch function.
-template <typename T, typename Context>
+template <typename T, typename Context, typename IndT>
 void LaunchIndexFillKernel(const Context& dev_ctx,
                            const DenseTensor& x,
                            const DenseTensor& index,
@@ -69,61 +72,29 @@ void LaunchIndexFillKernel(const Context& dev_ctx,
 
   T* out_data = dev_ctx.template Alloc<T>(out);
 
-  // Copy-then-modify: copy x to out first, skip if already sharing memory
-  // (inplace).
+  // Copy-then-overwrite; skip the copy when out already aliases x (inplace).
   if (!is_initialized || (x.data<T>() != out->data<T>())) {
     std::memcpy(out_data, x_data, numel * sizeof(T));
   }
 
-  if (index.numel() == 0) {
+  const int64_t index_size = index.numel();
+  if (index_size == 0) {
     return;
   }
 
-  // Cast int32 index to int64 on CPU (simple loop, no GPU kernel needed).
-  DenseTensor index_int64;
-  const DenseTensor* ptr_index = nullptr;
+  // Three-segment decomposition around `axis`.
+  int64_t outer_size = 1;
+  int64_t axis_size = 1;
+  int64_t inner_size = 1;
+  funcs::GetIndexFillDims(x.dims(), axis, &outer_size, &axis_size, &inner_size);
 
-  if (index.dtype() == DataType::INT32) {
-    index_int64.Resize(index.dims());
-    int64_t* index_int64_data = dev_ctx.template Alloc<int64_t>(&index_int64);
-    const int32_t* index_int32_data = index.data<int32_t>();
-
-    int64_t index_numel = index.numel();
-    for (int64_t i = 0; i < index_numel; ++i) {
-      index_int64_data[i] = static_cast<int64_t>(index_int32_data[i]);
-    }
-
-    ptr_index = &index_int64;
-  } else {
-    ptr_index = &index;
-  }
-
-  const int64_t* index_data = ptr_index->data<int64_t>();
-  const int64_t index_size = ptr_index->numel();
-
-  // Three-segment decomposition: split dims around the target axis.
-  const auto& x_dims = x.dims();
-  const int64_t x_dims_size = x_dims.size();
-
-  int64_t outer_size = 1;  // product of dims before axis
-  for (int64_t i = 0; i < axis; ++i) {
-    outer_size *= x_dims[i];
-  }
-
-  int64_t axis_size = x_dims[axis];  // the target dimension size
-
-  int64_t inner_size = 1;  // product of dims after axis
-  for (int64_t i = axis + 1; i < x_dims_size; ++i) {
-    inner_size *= x_dims[i];
-  }
-
-  index_fill_kernel<T>(index_data,
-                       index_size,
-                       fill_value,
-                       outer_size,
-                       axis_size,
-                       inner_size,
-                       out_data);
+  IndexFillInner<T, IndT>(index.data<IndT>(),
+                          index_size,
+                          outer_size,
+                          axis_size,
+                          inner_size,
+                          fill_value,
+                          out_data);
 }
 
 template <typename T, typename Context>
@@ -139,14 +110,24 @@ void IndexFillKernel(const Context& dev_ctx,
   }
 
   const int64_t x_dims_size = x.dims().size();
-
   if (axis < 0) {
     axis += x_dims_size;
   }
 
   T fill_value = value.to<T>();
 
-  LaunchIndexFillKernel<T, Context>(dev_ctx, x, index, axis, fill_value, out);
+  // Dispatch on index dtype to avoid a separate int32 -> int64 cast pass.
+  if (index.dtype() == DataType::INT32) {
+    LaunchIndexFillKernel<T, Context, int32_t>(
+        dev_ctx, x, index, axis, fill_value, out);
+  } else if (index.dtype() == DataType::INT64) {
+    LaunchIndexFillKernel<T, Context, int64_t>(
+        dev_ctx, x, index, axis, fill_value, out);
+  } else {
+    PADDLE_THROW(common::errors::InvalidArgument(
+        "The dtype of index must be int32 or int64, but received %s.",
+        DataTypeToString(index.dtype())));
+  }
 }
 
 }  // namespace phi

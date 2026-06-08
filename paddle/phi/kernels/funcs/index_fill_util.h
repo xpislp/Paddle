@@ -14,22 +14,40 @@
 
 #pragma once
 
+#include "paddle/phi/core/ddim.h"
+
 namespace phi {
 namespace funcs {
 
-// Cast index tensor elements from type T (e.g. int32) to int64_t on GPU.
-// This is needed because the index_fill kernel always works with int64 indices
-// internally, but users may pass int32 index tensors.
-template <typename T>
-__global__ void CastToInt64Kernel(const T* input,
-                                  int64_t* output,
-                                  int64_t numel) {
-  int64_t idx =
-      static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) +
-      static_cast<int64_t>(threadIdx.x);
-  if (idx < numel) {
-    output[idx] = static_cast<int64_t>(input[idx]);
-  }
+// Below this many indices the GPU kernel uses the "small index" path: each
+// index is loaded once into a register and reused across the whole slice.
+// PyTorch (aten/src/ATen/native/cuda/Indexing.cu) uses the same threshold.
+constexpr int64_t kIndexFillSmallIndexThreshold = 16;
+
+// Collapse an N-D tensor into the 3D logical shape [outer_size, dim_size,
+// inner_size] around the target `axis`. This is the shared layout used by both
+// the CPU and GPU index_fill forward/backward kernels:
+//
+//     outer_size = prod(dims[0 .. axis-1])   (dims before axis)
+//     dim_size   = dims[axis]                (the target dim)
+//     inner_size = prod(dims[axis+1 .. end]) (dims after axis)
+//
+//     offset = outer_idx * (dim_size * inner_size)
+//            + dim_idx   *  inner_size
+//            + inner_idx
+inline void GetIndexFillDims(const phi::DDim& dims,
+                             int axis,
+                             int64_t* outer_size,
+                             int64_t* dim_size,
+                             int64_t* inner_size) {
+  const int rank = dims.size();
+  int64_t outer = 1;
+  int64_t inner = 1;
+  for (int i = 0; i < axis; ++i) outer *= dims[i];
+  for (int i = axis + 1; i < rank; ++i) inner *= dims[i];
+  *outer_size = outer;
+  *dim_size = dims[axis];
+  *inner_size = inner;
 }
 
 }  // namespace funcs

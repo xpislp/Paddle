@@ -13,115 +13,76 @@
 // limitations under the License.
 
 #include "paddle/phi/kernels/index_fill_grad_kernel.h"
+
+#include <algorithm>
+
 #include "paddle/phi/backends/cpu/cpu_context.h"
+#include "paddle/phi/common/data_type.h"
+#include "paddle/phi/core/enforce.h"
 #include "paddle/phi/core/kernel_registry.h"
 #include "paddle/phi/core/tensor_utils.h"
+#include "paddle/phi/kernels/funcs/index_fill_util.h"
 
 namespace phi {
 
-// CPU implementation of the index_fill backward kernel.
-// Same logic as the GPU version:
-//   For each position selected by the index, set x_grad to 0.
-//
-// The flat iteration index is decomposed into (outer, index, inner) using
-// the same three-segment scheme, with OMP parallelization on the outermost
-// loop.
-template <typename T>
-void index_fill_grad_kernel(const int64_t N,
-                            const int64_t* index_data,
-                            const int64_t index_size,
-                            const int64_t dim_size,
-                            const int64_t outer_size,
-                            const int64_t inner_size,
-                            T* x_grad) {
+// Backward of index_fill: x_grad = copy(out_grad), then zero the positions that
+// the forward overwrote with a constant. That second step is just an index_fill
+// with value 0, sharing the forward's parallelization scheme: parallelize over
+// the (outer * index) slices and fill each contiguous inner run with std::fill_n.
+template <typename T, typename IndT>
+void IndexFillGradInner(const IndT* index_data,
+                        int64_t index_size,
+                        int64_t outer_size,
+                        int64_t dim_size,
+                        int64_t inner_size,
+                        T* x_grad) {
+  const int64_t num_slices = outer_size * index_size;
 #ifdef PADDLE_WITH_MKLML
 #pragma omp parallel for
 #endif
-  for (int64_t idx = 0; idx < N; ++idx) {
-    // Decompose flat index → (outer_idx, index_idx, inner_idx)
-    int64_t inner_idx = idx % inner_size;
-    int64_t temp = idx / inner_size;
-    int64_t index_idx = temp % index_size;
-    int64_t outer_idx = temp / index_size;
+  for (int64_t k = 0; k < num_slices; ++k) {
+    const int64_t outer = k / index_size;
+    const int64_t i = k % index_size;
 
-    int64_t dim_idx = index_data[index_idx];
-    if (dim_idx < 0) {
-      dim_idx += dim_size;
-    }
+    int64_t dim_idx = static_cast<int64_t>(index_data[i]);
+    if (dim_idx < 0) dim_idx += dim_size;  // negative indexing
 
-    int64_t offset =
-        outer_idx * dim_size * inner_size + dim_idx * inner_size + inner_idx;
-
-    // Zero out gradient at the filled position.
-    *(x_grad + offset) = static_cast<T>(0);
+    T* dst = x_grad + outer * dim_size * inner_size + dim_idx * inner_size;
+    std::fill_n(dst, inner_size, static_cast<T>(0));
   }
 }
 
-// CPU host-side launch function for the backward kernel.
-template <typename T, typename Context>
+template <typename T, typename Context, typename IndT>
 void LaunchIndexFillGradKernel(const Context& dev_ctx,
                                const DenseTensor& index,
                                const DenseTensor& out_grad,
                                const int dim,
                                DenseTensor* x_grad) {
-  // Step 1: x_grad = out_grad (full copy).
+  // Step 1: x_grad = out_grad.
   T* x_grad_data = dev_ctx.template Alloc<T>(x_grad);
   Copy(dev_ctx, out_grad, dev_ctx.GetPlace(), false, x_grad);
 
-  auto out_grad_dims = out_grad.dims();
-  const int rank = out_grad_dims.size();
-
-  // Cast index to int64 if needed.
-  DenseTensor index_int64;
-  const DenseTensor* ptr_index = nullptr;
-
-  if (index.dtype() == DataType::INT32) {
-    index_int64.Resize(index.dims());
-    int64_t* index_int64_data = dev_ctx.template Alloc<int64_t>(&index_int64);
-    const int32_t* index_int32_data = index.data<int32_t>();
-
-    int64_t index_numel = index.numel();
-    for (int64_t i = 0; i < index_numel; ++i) {
-      index_int64_data[i] = static_cast<int64_t>(index_int32_data[i]);
-    }
-
-    ptr_index = &index_int64;
-  } else {
-    ptr_index = &index;
-  }
-
-  const int64_t* index_data = ptr_index->data<int64_t>();
-  int64_t index_size = ptr_index->numel();
-
+  const int64_t index_size = index.numel();
   if (index_size == 0) {
     return;
   }
 
-  // Three-segment decomposition (same as forward).
+  // Three-segment decomposition around `dim`.
   int64_t outer_size = 1;
+  int64_t dim_size = 1;
   int64_t inner_size = 1;
-  int64_t dim_size = out_grad_dims[dim];
+  funcs::GetIndexFillDims(
+      out_grad.dims(), dim, &outer_size, &dim_size, &inner_size);
 
-  for (int i = 0; i < dim; ++i) {
-    outer_size *= out_grad_dims[i];
-  }
-  for (int i = dim + 1; i < rank; ++i) {
-    inner_size *= out_grad_dims[i];
-  }
-
-  // Step 2: zero out the positions that were filled in forward pass.
-  int64_t numel = outer_size * index_size * inner_size;
-
-  index_fill_grad_kernel<T>(numel,
-                            index_data,
-                            index_size,
-                            dim_size,
-                            outer_size,
-                            inner_size,
-                            x_grad_data);
+  // Step 2: zero out the filled positions.
+  IndexFillGradInner<T, IndT>(index.data<IndT>(),
+                              index_size,
+                              outer_size,
+                              dim_size,
+                              inner_size,
+                              x_grad_data);
 }
 
-// Top-level CPU backward kernel entry.
 template <typename T, typename Context>
 void IndexFillGradKernel(const Context& dev_ctx,
                          const DenseTensor& index,
@@ -133,21 +94,29 @@ void IndexFillGradKernel(const Context& dev_ctx,
     return;
   }
 
-  dev_ctx.template Alloc<T>(x_grad);
-
-  auto out_grad_dims = out_grad.dims();
-  const int rank = out_grad_dims.size();
-
+  const int rank = out_grad.dims().size();
   if (dim < 0) {
     dim += rank;
   }
 
   if (index.numel() == 0) {
+    dev_ctx.template Alloc<T>(x_grad);
     Copy(dev_ctx, out_grad, dev_ctx.GetPlace(), false, x_grad);
     return;
   }
 
-  LaunchIndexFillGradKernel<T, Context>(dev_ctx, index, out_grad, dim, x_grad);
+  // Dispatch on index dtype to avoid a separate int32 -> int64 cast pass.
+  if (index.dtype() == DataType::INT32) {
+    LaunchIndexFillGradKernel<T, Context, int32_t>(
+        dev_ctx, index, out_grad, dim, x_grad);
+  } else if (index.dtype() == DataType::INT64) {
+    LaunchIndexFillGradKernel<T, Context, int64_t>(
+        dev_ctx, index, out_grad, dim, x_grad);
+  } else {
+    PADDLE_THROW(common::errors::InvalidArgument(
+        "The dtype of index must be int32 or int64, but received %s.",
+        DataTypeToString(index.dtype())));
+  }
 }
 
 }  // namespace phi
